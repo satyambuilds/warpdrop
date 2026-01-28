@@ -28,13 +28,37 @@ export class WebRTCManager {
     this.isPaused = false;
     this.currentChunkIndex = 0;
     this.fileWriter = null; // For FileSystem API
-    
+
+    // Speed tracking
+    this.transferStartTime = null;
+    this.lastSpeedUpdate = null;
+    this.bytesTransferred = 0;
+    this.lastBytesTransferred = 0;
+    this.currentSpeed = 0; // bytes per second
+    this.speedSamples = []; // for smoothing
+
+    // Resume/retry
+    this.shouldAutoReconnect = true;
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = 3;
+    this.reconnectTimeout = null;
+
+    // Connection quality
+    this.statsInterval = null;
+    this.connectionQuality = {
+      rtt: 0,
+      packetLoss: 0,
+      jitter: 0
+    };
+
     // Callbacks
     this.onConnectionStateChange = null;
     this.onProgress = null;
     this.onComplete = null;
     this.onError = null;
     this.onMetadata = null;
+    this.onReconnecting = null;
+    this.onConnectionQuality = null;
   }
 
   async connect(retryCount = 0) {
@@ -145,24 +169,15 @@ export class WebRTCManager {
     switch (message.type) {
       case 'ready':
         console.log('Received ready signal, role:', this.role);
-        // Sender creates offer after getting ready signal
-        if (this.role === 'sender' && !this.pc) {
-          console.log('Sender: Creating offer...');
-          await this._createOffer();
-        }
+        // Don't create offer yet - wait for peer-connected
         break;
-        
+
       case 'peer-connected':
         console.log('Peer connected:', message.role);
-        // If sender and receiver just connected, create offer
-        if (this.role === 'sender' && message.role === 'receiver') {
-          console.log('Receiver connected!');
-          if (!this.pc) {
-            console.log('Creating offer for receiver...');
-            await this._createOffer();
-          } else {
-            console.log('PeerConnection already exists, offer already sent');
-          }
+        // Sender creates offer when receiver connects
+        if (this.role === 'sender' && message.role === 'receiver' && !this.pc) {
+          console.log('Receiver connected! Creating offer...');
+          await this._createOffer();
         }
         break;
         
@@ -182,8 +197,12 @@ export class WebRTCManager {
         break;
         
       case 'peer-disconnected':
-        console.log('Peer disconnected!');
-        this._handleError(new Error('Peer disconnected'));
+        console.log('⚠️ Peer disconnected!');
+        if (this.isTransferActive && this.shouldAutoReconnect) {
+          this._attemptReconnect();
+        } else {
+          this._handleError(new Error('Peer disconnected'));
+        }
         break;
     }
   }
@@ -261,12 +280,23 @@ export class WebRTCManager {
     this.pc.onconnectionstatechange = () => {
       console.log('🔗 WebRTC Connection state:', this.pc.connectionState);
       this._updateConnectionState(this.pc.connectionState);
-      
+
       if (this.pc.connectionState === 'connected') {
         console.log('✅ WebRTC P2P connection established!');
+        // Reset reconnect attempts on successful connection
+        this.reconnectAttempts = 0;
       } else if (this.pc.connectionState === 'failed') {
         console.error('❌ WebRTC connection failed');
-        this._handleError(new Error('Connection failed'));
+        if (this.isTransferActive && this.shouldAutoReconnect) {
+          this._attemptReconnect();
+        } else {
+          this._handleError(new Error('Connection failed'));
+        }
+      } else if (this.pc.connectionState === 'disconnected') {
+        console.warn('⚠️ WebRTC connection disconnected');
+        if (this.isTransferActive && this.shouldAutoReconnect) {
+          this._attemptReconnect();
+        }
       }
     };
 
@@ -279,13 +309,16 @@ export class WebRTCManager {
 
   _setupDataChannel() {
     this.dataChannel.binaryType = 'arraybuffer';
-    
+
     this.dataChannel.onopen = async () => {
       console.log('✅ Data channel opened - Ready to transfer!');
       this._updateConnectionState('connected');
-      
+
       // Acquire wake lock to prevent tab sleep
       await this._acquireWakeLock();
+
+      // Start monitoring connection quality
+      this._startStatsMonitoring();
     };
 
     this.dataChannel.onclose = () => {
@@ -318,21 +351,25 @@ export class WebRTCManager {
       if (typeof data === 'string') {
         // Control message
         const message = JSON.parse(data);
-        
+
         switch (message.type) {
           case 'metadata':
             this.fileMetadata = message;
             this.totalChunks = Math.ceil(message.size / CHUNK_SIZE);
             console.log(`📦 Receiving file: ${message.name} (${this.formatBytes(message.size)}, ${this.totalChunks} chunks)`);
-            
-            // Note: FileSystem API requires user gesture, so we'll use Blob approach
-            // which works well even for large files in modern browsers
-            console.log('Using in-memory chunking (will trigger download when complete)');
-            
+
+            // Try to use FileSystem API for large files
+            if (message.size > 50 * 1024 * 1024) { // > 50MB
+              console.log('Large file detected, attempting to use FileSystem API...');
+              await this._initFileWriter(message.name);
+            } else {
+              console.log('Small file, using in-memory buffering');
+            }
+
             if (this.onMetadata) {
               this.onMetadata(message);
             }
-            
+
             // Send ready signal
             this._sendControlMessage({ type: 'ready' });
             break;
@@ -408,12 +445,16 @@ export class WebRTCManager {
     
     reader.onload = (e) => {
       if (this.dataChannel.readyState === 'open') {
-        this.dataChannel.send(e.target.result);
+        const chunkData = e.target.result;
+        this.dataChannel.send(chunkData);
         this.currentChunkIndex++;
-        
+
+        // Calculate transfer speed
+        const speed = this._calculateSpeed(chunkData.byteLength);
+
         const progress = (this.currentChunkIndex / this.totalChunks) * 100;
         if (this.onProgress) {
-          this.onProgress(progress, this.currentChunkIndex, this.totalChunks);
+          this.onProgress(progress, this.currentChunkIndex, this.totalChunks, speed);
         }
 
         if (this.currentChunkIndex >= this.totalChunks) {
@@ -443,24 +484,33 @@ export class WebRTCManager {
         return;
       }
 
-      this.receivedChunks.set(this.receivedChunkCount, data);
-      this.receivedChunkCount++;
-
-      const progress = (this.receivedChunkCount / this.totalChunks) * 100;
-      
-      if (this.onProgress) {
-        this.onProgress(progress, this.receivedChunkCount, this.totalChunks);
-      }
-
       // Write to disk if using FileSystem API
       if (this.fileWriter) {
         try {
           await this.fileWriter.write(data);
+          this.receivedChunkCount++;
         } catch (error) {
-          console.error('Error writing to file:', error);
+          console.error('Error writing to file, falling back to memory:', error);
           // Fallback to memory if write fails
+          await this.fileWriter.close().catch(() => {});
           this.fileWriter = null;
+          // Store this chunk and continue with memory mode
+          this.receivedChunks.set(this.receivedChunkCount, data);
+          this.receivedChunkCount++;
         }
+      } else {
+        // Store in memory if FileSystem API not available
+        this.receivedChunks.set(this.receivedChunkCount, data);
+        this.receivedChunkCount++;
+      }
+
+      // Calculate transfer speed
+      const speed = this._calculateSpeed(data.byteLength);
+
+      const progress = (this.receivedChunkCount / this.totalChunks) * 100;
+
+      if (this.onProgress) {
+        this.onProgress(progress, this.receivedChunkCount, this.totalChunks, speed);
       }
 
       // Send acknowledgment for flow control
@@ -474,7 +524,7 @@ export class WebRTCManager {
   async _initFileWriter(fileName) {
     try {
       if ('showSaveFilePicker' in window) {
-        console.log('Prompting user for file save location...');
+        console.log('🗂️ Prompting user for file save location...');
         const handle = await window.showSaveFilePicker({
           suggestedName: fileName,
           types: [{
@@ -482,20 +532,22 @@ export class WebRTCManager {
             accept: { '*/*': [] }
           }]
         });
-        
+
         this.fileWriter = await handle.createWritable();
-        console.log('FileSystem API initialized successfully');
+        console.log('✅ FileSystem API initialized - will stream directly to disk');
+        console.log('💾 Memory usage optimized for large file transfer');
         return true;
       } else {
-        console.log('FileSystem API not supported, will use blob download');
+        console.log('⚠️ FileSystem API not supported in this browser');
+        console.log('📝 Will use in-memory buffering (may cause issues with very large files)');
         return false;
       }
     } catch (error) {
       // User cancelled or error occurred
       if (error.name === 'AbortError') {
-        console.log('User cancelled file save dialog, will use blob download');
+        console.log('❌ User cancelled save dialog - will use default download location');
       } else {
-        console.warn('FileSystem API error:', error);
+        console.warn('⚠️ FileSystem API error:', error);
       }
       this.fileWriter = null;
       return false;
@@ -506,12 +558,17 @@ export class WebRTCManager {
     try {
       if (this.fileWriter) {
         // Close the file writer
+        console.log('💾 Closing file writer...');
         await this.fileWriter.close();
         console.log('✅ File written to disk via FileSystem API');
+
+        // Clear any chunks that might have been stored before FileSystem API initialized
+        this.receivedChunks.clear();
+
         this._completeTransfer();
       } else {
         // Combine chunks from memory
-        console.log(`📦 Combining ${this.receivedChunkCount} chunks...`);
+        console.log(`📦 Combining ${this.receivedChunkCount} chunks from memory...`);
         const chunks = [];
         for (let i = 0; i < this.receivedChunkCount; i++) {
           const chunk = this.receivedChunks.get(i);
@@ -519,16 +576,16 @@ export class WebRTCManager {
             chunks.push(chunk);
           }
         }
-        
+
         if (chunks.length === 0) {
           throw new Error('No chunks received');
         }
-        
+
         const blob = new Blob(chunks, { type: this.fileMetadata.mimeType || 'application/octet-stream' });
         console.log(`✅ Created blob: ${this.formatBytes(blob.size)}`);
-        
+
         const url = URL.createObjectURL(blob);
-        
+
         // Trigger download
         console.log('📥 Starting download...');
         const a = document.createElement('a');
@@ -536,13 +593,14 @@ export class WebRTCManager {
         a.download = this.fileMetadata.name || 'download';
         document.body.appendChild(a);
         a.click();
-        
-        // Clean up after a delay
+
+        // Clean up
         setTimeout(() => {
           document.body.removeChild(a);
           URL.revokeObjectURL(url);
+          this.receivedChunks.clear();
         }, 100);
-        
+
         console.log('✅ File download started!');
         this._completeTransfer();
       }
@@ -560,10 +618,122 @@ export class WebRTCManager {
     return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
   }
 
+  _calculateSpeed(chunkSize) {
+    const now = Date.now();
+
+    // Initialize on first chunk
+    if (!this.transferStartTime) {
+      this.transferStartTime = now;
+      this.lastSpeedUpdate = now;
+      return 0;
+    }
+
+    this.bytesTransferred += chunkSize;
+
+    // Update speed every 500ms
+    const timeSinceLastUpdate = now - this.lastSpeedUpdate;
+    if (timeSinceLastUpdate >= 500) {
+      const bytesSinceLastUpdate = this.bytesTransferred - this.lastBytesTransferred;
+      const instantSpeed = (bytesSinceLastUpdate / timeSinceLastUpdate) * 1000; // bytes per second
+
+      // Smooth speed using moving average (keep last 5 samples)
+      this.speedSamples.push(instantSpeed);
+      if (this.speedSamples.length > 5) {
+        this.speedSamples.shift();
+      }
+
+      this.currentSpeed = this.speedSamples.reduce((a, b) => a + b, 0) / this.speedSamples.length;
+
+      this.lastSpeedUpdate = now;
+      this.lastBytesTransferred = this.bytesTransferred;
+    }
+
+    return this.currentSpeed;
+  }
+
+  formatSpeed(bytesPerSecond) {
+    if (bytesPerSecond === 0) return '0 B/s';
+    const k = 1024;
+    const sizes = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
+    const i = Math.floor(Math.log(bytesPerSecond) / Math.log(k));
+    return Math.round(bytesPerSecond / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+  }
+
+  _startStatsMonitoring() {
+    if (!this.pc) return;
+
+    // Clear any existing interval
+    if (this.statsInterval) {
+      clearInterval(this.statsInterval);
+    }
+
+    // Poll stats every 1 second
+    this.statsInterval = setInterval(async () => {
+      await this._collectConnectionStats();
+    }, 1000);
+
+    console.log('📊 Started connection quality monitoring');
+  }
+
+  async _collectConnectionStats() {
+    if (!this.pc) return;
+
+    try {
+      const stats = await this.pc.getStats();
+
+      stats.forEach(report => {
+        // RTT and packet loss are in candidate-pair reports
+        if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+          if (report.currentRoundTripTime !== undefined) {
+            this.connectionQuality.rtt = Math.round(report.currentRoundTripTime * 1000); // Convert to ms
+          }
+        }
+
+        // Packet loss from inbound-rtp
+        if (report.type === 'inbound-rtp' && report.kind === 'video') {
+          if (report.packetsLost !== undefined && report.packetsReceived !== undefined) {
+            const totalPackets = report.packetsLost + report.packetsReceived;
+            this.connectionQuality.packetLoss = totalPackets > 0
+              ? Math.round((report.packetsLost / totalPackets) * 100)
+              : 0;
+          }
+          if (report.jitter !== undefined) {
+            this.connectionQuality.jitter = Math.round(report.jitter * 1000); // Convert to ms
+          }
+        }
+
+        // For data channels, check transport stats
+        if (report.type === 'transport') {
+          // Some browsers provide RTT here
+          if (report.currentRoundTripTime !== undefined) {
+            this.connectionQuality.rtt = Math.round(report.currentRoundTripTime * 1000);
+          }
+        }
+      });
+
+      // Notify callback
+      if (this.onConnectionQuality) {
+        this.onConnectionQuality(this.connectionQuality);
+      }
+
+    } catch (error) {
+      console.warn('Failed to collect connection stats:', error);
+    }
+  }
+
+  _stopStatsMonitoring() {
+    if (this.statsInterval) {
+      clearInterval(this.statsInterval);
+      this.statsInterval = null;
+      console.log('📊 Stopped connection quality monitoring');
+    }
+  }
+
   _completeTransfer() {
     this.isTransferActive = false;
     this._releaseWakeLock();
-    
+    this._stopStatsMonitoring();
+
     if (this.onComplete) {
       this.onComplete();
     }
@@ -613,24 +783,91 @@ export class WebRTCManager {
     console.error('WebRTC error:', error);
     this.isTransferActive = false;
     this._releaseWakeLock();
-    
+    this._stopStatsMonitoring();
+
     if (this.onError) {
       this.onError(error);
     }
   }
 
+  async _attemptReconnect() {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      console.error('❌ Max reconnection attempts reached');
+      this._handleError(new Error('Connection lost - max reconnection attempts reached'));
+      return;
+    }
+
+    this.reconnectAttempts++;
+    const waitTime = Math.min(2000 * this.reconnectAttempts, 10000); // Exponential backoff, max 10s
+
+    console.log(`🔄 Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts}) in ${waitTime}ms...`);
+
+    if (this.onReconnecting) {
+      this.onReconnecting(this.reconnectAttempts, this.maxReconnectAttempts);
+    }
+
+    // Close existing connections
+    if (this.pc) {
+      this.pc.close();
+      this.pc = null;
+    }
+    if (this.dataChannel) {
+      this.dataChannel.close();
+      this.dataChannel = null;
+    }
+
+    // Wait before reconnecting
+    await new Promise(resolve => setTimeout(resolve, waitTime));
+
+    try {
+      // Reconnect WebSocket if needed
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        await this.connect();
+      }
+
+      // The peer-connected message will trigger offer/answer exchange
+      console.log('✅ Reconnected, waiting for peer...');
+
+      // If we're the sender and have progress, we'll resume from last chunk
+      if (this.role === 'sender' && this.currentChunkIndex > 0) {
+        console.log(`📤 Will resume from chunk ${this.currentChunkIndex}/${this.totalChunks}`);
+      }
+
+      // If we're the receiver, send resume request
+      if (this.role === 'receiver' && this.receivedChunkCount > 0) {
+        console.log(`📥 Requesting resume from chunk ${this.receivedChunkCount}`);
+        this._sendControlMessage({
+          type: 'resume-request',
+          fromChunk: this.receivedChunkCount
+        });
+      }
+
+      // Reset reconnect counter on successful reconnect
+      this.reconnectAttempts = 0;
+
+    } catch (error) {
+      console.error('Reconnection failed:', error);
+      this._attemptReconnect(); // Try again
+    }
+  }
+
   disconnect() {
+    this.shouldAutoReconnect = false; // Disable auto-reconnect on manual disconnect
     this.isTransferActive = false;
     this._releaseWakeLock();
-    
+
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+    }
+
     if (this.dataChannel) {
       this.dataChannel.close();
     }
-    
+
     if (this.pc) {
       this.pc.close();
     }
-    
+
     if (this.ws) {
       this.ws.close();
     }
