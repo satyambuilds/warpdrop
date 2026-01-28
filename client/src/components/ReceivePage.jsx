@@ -25,7 +25,8 @@ function ReceivePage() {
   const [stats, setStats] = useState({
     currentChunk: 0,
     totalChunks: 0,
-    speed: 0
+    speed: 0,
+    eta: 0
   });
   const [connectionQuality, setConnectionQuality] = useState({
     rtt: 0,
@@ -86,12 +87,13 @@ function ReceivePage() {
       setReceiving(true);
     };
 
-    rtc.onProgress = (progressPercent, currentChunk, totalChunks, speed) => {
+    rtc.onProgress = (progressPercent, currentChunk, totalChunks, speed, eta) => {
       setProgress(progressPercent);
       setStats({
         currentChunk,
         totalChunks,
-        speed: speed || 0
+        speed: speed || 0,
+        eta: eta || 0
       });
     };
 
@@ -139,6 +141,33 @@ function ReceivePage() {
     const sizes = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
     const i = Math.floor(Math.log(bytesPerSecond) / Math.log(k));
     return Math.round(bytesPerSecond / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+  };
+
+  const formatETA = (seconds) => {
+    if (!seconds || seconds === 0 || !isFinite(seconds)) {
+      return 'Calculating...';
+    }
+
+    // Round to nearest 30 seconds for less jumpiness
+    const roundedSeconds = Math.round(seconds / 30) * 30;
+
+    if (roundedSeconds < 60) {
+      return `${roundedSeconds}s`;
+    } else if (roundedSeconds < 3600) {
+      const minutes = Math.floor(roundedSeconds / 60);
+      const secs = roundedSeconds % 60;
+      if (secs === 0) {
+        return `${minutes}m`;
+      }
+      return `${minutes}m ${secs}s`;
+    } else {
+      const hours = Math.floor(roundedSeconds / 3600);
+      const minutes = Math.floor((roundedSeconds % 3600) / 60);
+      if (minutes === 0) {
+        return `${hours}h`;
+      }
+      return `${hours}h ${minutes}m`;
+    }
   };
 
   const getStatusDisplay = () => {
@@ -321,7 +350,7 @@ function ReceivePage() {
                 animate={{ opacity: 1, height: 'auto' }}
                 style={{ marginTop: '2rem' }}
               >
-                <div className="stats-grid">
+                <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))' }}>
                   <div className="stat-card">
                     <div className="stat-value">{Math.round(progress)}%</div>
                     <div className="stat-label">Progress</div>
@@ -335,6 +364,10 @@ function ReceivePage() {
                   <div className="stat-card">
                     <div className="stat-value">{formatSpeed(stats.speed)}</div>
                     <div className="stat-label">Speed</div>
+                  </div>
+                  <div className="stat-card">
+                    <div className="stat-value">{formatETA(stats.eta)}</div>
+                    <div className="stat-label">Time Left</div>
                   </div>
                 </div>
 

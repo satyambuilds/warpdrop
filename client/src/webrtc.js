@@ -1,8 +1,9 @@
 // WebRTC P2P Connection Manager with Advanced Features
 // Handles: memory management, flow control, chunking, resume capability
 
-const CHUNK_SIZE = 256 * 1024; // 256KB chunks
-const MAX_BUFFER_SIZE = 1 * 1024 * 1024; // 1MB buffer threshold
+const CHUNK_SIZE = 256 * 1024; // 256KB chunks (reliable size)
+const MAX_BUFFER_SIZE = 4 * 1024 * 1024; // 4MB buffer threshold (very conservative)
+const SEND_DELAY_MS = 5; // 5ms delay between chunks for network stability
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
@@ -36,6 +37,7 @@ export class WebRTCManager {
     this.lastBytesTransferred = 0;
     this.currentSpeed = 0; // bytes per second
     this.speedSamples = []; // for smoothing
+    this.etaSamples = []; // for ETA smoothing
 
     // Resume/retry
     this.shouldAutoReconnect = true;
@@ -198,10 +200,14 @@ export class WebRTCManager {
         
       case 'peer-disconnected':
         console.log('⚠️ Peer disconnected!');
+        // Only error if transfer was active, otherwise just log (might be initial connection)
         if (this.isTransferActive && this.shouldAutoReconnect) {
+          console.log('Transfer was active, attempting reconnect...');
           this._attemptReconnect();
+        } else if (this.isTransferActive) {
+          this._handleError(new Error('Peer disconnected during transfer'));
         } else {
-          this._handleError(new Error('Peer disconnected'));
+          console.log('Peer disconnected before transfer started (ignoring)');
         }
         break;
     }
@@ -214,15 +220,20 @@ export class WebRTCManager {
       this.pc.close();
       this.pc = null;
     }
-    
+
     console.log('📤 Creating WebRTC offer...');
-    this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    this.pc = new RTCPeerConnection({
+      iceServers: ICE_SERVERS,
+      // Optimize for large data transfers
+      bundlePolicy: 'max-bundle',
+      rtcpMuxPolicy: 'require'
+    });
     this._setupPeerConnection();
     
     // Create data channel (sender creates it)
     this.dataChannel = this.pc.createDataChannel('fileTransfer', {
-      ordered: true,
-      maxRetransmits: 3
+      ordered: true
+      // No maxRetransmits or maxPacketLifeTime = reliable delivery (infinite retries)
     });
     this._setupDataChannel();
     
@@ -238,7 +249,12 @@ export class WebRTCManager {
 
   async _handleOffer(offer) {
     console.log('📥 Received offer, creating answer...');
-    this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    this.pc = new RTCPeerConnection({
+      iceServers: ICE_SERVERS,
+      // Optimize for large data transfers
+      bundlePolicy: 'max-bundle',
+      rtcpMuxPolicy: 'require'
+    });
     this._setupPeerConnection();
     
     await this.pc.setRemoteDescription(new RTCSessionDescription(offer));
@@ -310,6 +326,9 @@ export class WebRTCManager {
   _setupDataChannel() {
     this.dataChannel.binaryType = 'arraybuffer';
 
+    // Set buffer threshold for flow control
+    this.dataChannel.bufferedAmountLowThreshold = 1 * 1024 * 1024; // 1MB threshold (25% of max)
+
     this.dataChannel.onopen = async () => {
       console.log('✅ Data channel opened - Ready to transfer!');
       this._updateConnectionState('connected');
@@ -328,8 +347,14 @@ export class WebRTCManager {
     };
 
     this.dataChannel.onerror = (error) => {
-      console.error('Data channel error:', error);
-      this._handleError(error);
+      console.error('❌ Data channel error:', error);
+      // Don't immediately fail - might be transient
+      if (this.isTransferActive && this.shouldAutoReconnect) {
+        console.log('⚠️ Data channel error during transfer, attempting recovery...');
+        this._attemptReconnect();
+      } else {
+        this._handleError(new Error('Data channel error'));
+      }
     };
 
     this.dataChannel.onmessage = async (event) => {
@@ -339,7 +364,8 @@ export class WebRTCManager {
     // Monitor buffer for flow control (sender side)
     if (this.role === 'sender') {
       this.dataChannel.onbufferedamountlow = () => {
-        if (this.isTransferActive && !this.isPaused) {
+        if (this.isTransferActive && !this.isPaused && this.currentChunkIndex < this.totalChunks) {
+          // Buffer drained, continue sending
           this._sendNextChunk();
         }
       };
@@ -370,13 +396,25 @@ export class WebRTCManager {
               this.onMetadata(message);
             }
 
-            // Send ready signal
+            // Send ready signal to start transfer
             this._sendControlMessage({ type: 'ready' });
+            console.log('✅ Receiver ready, transfer will start');
+            break;
+
+          case 'ready':
+            // Sender receives ready from receiver - start sending
+            if (this.role === 'sender' && this.file) {
+              console.log('🚀 Receiver ready! Starting transfer...');
+              console.log(`   Transferring ${this.totalChunks} chunks (${this.formatBytes(CHUNK_SIZE)} each)`);
+              console.log(`   Buffer limit: ${this.formatBytes(MAX_BUFFER_SIZE)}`);
+              this._sendNextChunk();
+            } else if (this.role === 'sender') {
+              console.warn('⚠️ Received ready signal but no file set!');
+            }
             break;
             
           case 'chunk-ack':
-            // Sender receives acknowledgment
-            this._sendNextChunk();
+            // Legacy - no longer used for flow control
             break;
             
           case 'complete':
@@ -402,14 +440,22 @@ export class WebRTCManager {
 
   // SENDER: Start sending file
   async sendFile(file) {
-    if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
-      throw new Error('Data channel not ready');
-    }
-
     this.file = file;
     this.totalChunks = Math.ceil(file.size / CHUNK_SIZE);
     this.currentChunkIndex = 0;
     this.isTransferActive = true;
+
+    console.log(`📤 Preparing to send: ${file.name}`);
+    console.log(`   Size: ${this.formatBytes(file.size)}`);
+    console.log(`   Chunks: ${this.totalChunks} x ${this.formatBytes(CHUNK_SIZE)}`);
+
+    // Wait for data channel to be ready
+    if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
+      console.log('⏳ Waiting for data channel to open...');
+      await this._waitForDataChannel();
+    }
+
+    console.log('✅ Data channel ready');
 
     // Send metadata first
     const metadata = {
@@ -422,58 +468,94 @@ export class WebRTCManager {
     };
 
     this._sendControlMessage(metadata);
-    
+
     // Wait for receiver ready signal before starting
-    console.log('File metadata sent, waiting for receiver...');
+    console.log('📨 Metadata sent, waiting for receiver to accept...');
+  }
+
+  async _waitForDataChannel() {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('Data channel open timeout'));
+      }, 30000); // 30 second timeout
+
+      const checkInterval = setInterval(() => {
+        if (this.dataChannel && this.dataChannel.readyState === 'open') {
+          clearInterval(checkInterval);
+          clearTimeout(timeout);
+          resolve();
+        }
+      }, 100);
+    });
   }
 
   async _sendNextChunk() {
     if (!this.isTransferActive || this.isPaused) return;
     if (this.currentChunkIndex >= this.totalChunks) return;
 
-    // Check buffer size for flow control
-    if (this.dataChannel.bufferedAmount > MAX_BUFFER_SIZE) {
-      console.log('Buffer full, waiting...');
+    // Check buffer space - be very conservative
+    if (this.dataChannel.bufferedAmount > MAX_BUFFER_SIZE * 0.75) {
+      // Buffer is getting full, wait for bufferedamountlow event
       return;
     }
 
+    // Send chunks one at a time
     const start = this.currentChunkIndex * CHUNK_SIZE;
     const end = Math.min(start + CHUNK_SIZE, this.file.size);
     const chunk = this.file.slice(start, end);
 
-    const reader = new FileReader();
-    
-    reader.onload = (e) => {
-      if (this.dataChannel.readyState === 'open') {
-        const chunkData = e.target.result;
-        this.dataChannel.send(chunkData);
-        this.currentChunkIndex++;
+    try {
+      const chunkData = await this._readChunk(chunk);
 
-        // Calculate transfer speed
-        const speed = this._calculateSpeed(chunkData.byteLength);
+      if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
+        console.warn('Data channel not ready, pausing...');
+        return;
+      }
 
-        const progress = (this.currentChunkIndex / this.totalChunks) * 100;
-        if (this.onProgress) {
-          this.onProgress(progress, this.currentChunkIndex, this.totalChunks, speed);
-        }
+      // Final buffer check before sending
+      if (this.dataChannel.bufferedAmount + chunkData.byteLength > MAX_BUFFER_SIZE) {
+        // Buffer full, wait for drain
+        return;
+      }
 
-        if (this.currentChunkIndex >= this.totalChunks) {
-          this._sendControlMessage({ type: 'complete' });
-          this._completeTransfer();
-        } else {
-          // Continue sending if buffer allows
-          if (this.dataChannel.bufferedAmount < MAX_BUFFER_SIZE) {
+      this.dataChannel.send(chunkData);
+      this.currentChunkIndex++;
+
+      // Calculate transfer speed and ETA
+      const speed = this._calculateSpeed(chunkData.byteLength);
+      const eta = this._calculateETA();
+
+      const progress = (this.currentChunkIndex / this.totalChunks) * 100;
+      if (this.onProgress) {
+        this.onProgress(progress, this.currentChunkIndex, this.totalChunks, speed, eta);
+      }
+
+      if (this.currentChunkIndex >= this.totalChunks) {
+        console.log('✅ All chunks sent!');
+        this._sendControlMessage({ type: 'complete' });
+        this._completeTransfer();
+      } else {
+        // Add small delay for network stability (especially important for high latency)
+        setTimeout(() => {
+          if (this.isTransferActive && this.dataChannel.bufferedAmount < MAX_BUFFER_SIZE * 0.75) {
             this._sendNextChunk();
           }
-        }
+          // Otherwise wait for bufferedamountlow event
+        }, SEND_DELAY_MS);
       }
-    };
-
-    reader.onerror = (error) => {
+    } catch (error) {
+      console.error('Error sending chunk:', error);
       this._handleError(error);
-    };
+    }
+  }
 
-    reader.readAsArrayBuffer(chunk);
+  async _readChunk(chunk) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => resolve(e.target.result);
+      reader.onerror = (e) => reject(e);
+      reader.readAsArrayBuffer(chunk);
+    });
   }
 
   // RECEIVER: Handle incoming chunk
@@ -484,37 +566,36 @@ export class WebRTCManager {
         return;
       }
 
-      // Write to disk if using FileSystem API
+      // Write to disk if using FileSystem API (non-blocking for speed)
       if (this.fileWriter) {
-        try {
-          await this.fileWriter.write(data);
-          this.receivedChunkCount++;
-        } catch (error) {
+        // Fire and forget for max speed - errors handled separately
+        this.fileWriter.write(data).catch(error => {
           console.error('Error writing to file, falling back to memory:', error);
-          // Fallback to memory if write fails
-          await this.fileWriter.close().catch(() => {});
+          this.fileWriter.close().catch(() => {});
           this.fileWriter = null;
-          // Store this chunk and continue with memory mode
+          // Store in memory from now on
           this.receivedChunks.set(this.receivedChunkCount, data);
-          this.receivedChunkCount++;
-        }
+        });
+        this.receivedChunkCount++;
       } else {
         // Store in memory if FileSystem API not available
         this.receivedChunks.set(this.receivedChunkCount, data);
         this.receivedChunkCount++;
       }
 
-      // Calculate transfer speed
+      // Calculate transfer speed and ETA
       const speed = this._calculateSpeed(data.byteLength);
+      const eta = this._calculateETA();
 
       const progress = (this.receivedChunkCount / this.totalChunks) * 100;
 
-      if (this.onProgress) {
-        this.onProgress(progress, this.receivedChunkCount, this.totalChunks, speed);
-      }
+      // Update UI less frequently for better performance (every 100 chunks or 1%)
+      const shouldUpdate = this.receivedChunkCount % 100 === 0 ||
+                          Math.floor(progress) !== Math.floor((this.receivedChunkCount - 1) / this.totalChunks * 100);
 
-      // Send acknowledgment for flow control
-      this._sendControlMessage({ type: 'chunk-ack', chunkIndex: this.receivedChunkCount - 1 });
+      if (shouldUpdate && this.onProgress) {
+        this.onProgress(progress, this.receivedChunkCount, this.totalChunks, speed, eta);
+      }
     } catch (error) {
       console.error('Error handling chunk data:', error);
       this._handleError(error);
@@ -659,6 +740,69 @@ export class WebRTCManager {
     return Math.round(bytesPerSecond / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
   }
 
+  _calculateETA() {
+    if (this.currentSpeed === 0 || this.totalChunks === 0) {
+      return 0; // No ETA available yet
+    }
+
+    // Calculate remaining bytes
+    const completedChunks = this.role === 'sender' ? this.currentChunkIndex : this.receivedChunkCount;
+    const remainingChunks = this.totalChunks - completedChunks;
+
+    // More accurate remaining bytes calculation
+    let remainingBytes;
+    if (this.role === 'sender' && this.file) {
+      const completedBytes = completedChunks * CHUNK_SIZE;
+      remainingBytes = this.file.size - completedBytes;
+    } else if (this.fileMetadata) {
+      const completedBytes = completedChunks * CHUNK_SIZE;
+      remainingBytes = this.fileMetadata.size - completedBytes;
+    } else {
+      remainingBytes = remainingChunks * CHUNK_SIZE;
+    }
+
+    // Calculate ETA in seconds
+    const instantETA = remainingBytes / this.currentSpeed;
+
+    // Smooth ETA using moving average (larger window = more stable)
+    this.etaSamples.push(instantETA);
+    if (this.etaSamples.length > 10) { // Keep last 10 samples (more than speed for stability)
+      this.etaSamples.shift();
+    }
+
+    // Calculate smoothed ETA
+    const smoothedETA = this.etaSamples.reduce((a, b) => a + b, 0) / this.etaSamples.length;
+
+    return Math.max(0, smoothedETA); // Don't return negative
+  }
+
+  formatETA(seconds) {
+    if (seconds === 0 || !isFinite(seconds)) {
+      return 'Calculating...';
+    }
+
+    // Round to nearest 30 seconds for less jumpiness
+    const roundedSeconds = Math.round(seconds / 30) * 30;
+
+    if (roundedSeconds < 60) {
+      return `${roundedSeconds}s`;
+    } else if (roundedSeconds < 3600) {
+      const minutes = Math.floor(roundedSeconds / 60);
+      const secs = roundedSeconds % 60;
+      if (secs === 0) {
+        return `${minutes}m`;
+      }
+      return `${minutes}m ${secs}s`;
+    } else {
+      const hours = Math.floor(roundedSeconds / 3600);
+      const minutes = Math.floor((roundedSeconds % 3600) / 60);
+      if (minutes === 0) {
+        return `${hours}h`;
+      }
+      return `${hours}h ${minutes}m`;
+    }
+  }
+
   _startStatsMonitoring() {
     if (!this.pc) return;
 
@@ -667,10 +811,10 @@ export class WebRTCManager {
       clearInterval(this.statsInterval);
     }
 
-    // Poll stats every 1 second
+    // Poll stats every 2 seconds (reduced overhead)
     this.statsInterval = setInterval(async () => {
       await this._collectConnectionStats();
-    }, 1000);
+    }, 2000);
 
     console.log('📊 Started connection quality monitoring');
   }
