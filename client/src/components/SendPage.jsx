@@ -20,10 +20,17 @@ function SendPage() {
   const [complete, setComplete] = useState(false);
   const [error, setError] = useState(null);
   const [webrtc, setWebrtc] = useState(null);
+  const [reconnecting, setReconnecting] = useState(false);
+  const [reconnectAttempt, setReconnectAttempt] = useState(0);
   const [stats, setStats] = useState({
     currentChunk: 0,
     totalChunks: 0,
     speed: 0
+  });
+  const [connectionQuality, setConnectionQuality] = useState({
+    rtt: 0,
+    packetLoss: 0,
+    jitter: 0
   });
 
   const transferUrl = `${window.location.origin}/transfer/${roomId}`;
@@ -54,13 +61,13 @@ function SendPage() {
       }
     };
 
-    rtc.onProgress = (progressPercent, currentChunk, totalChunks) => {
+    rtc.onProgress = (progressPercent, currentChunk, totalChunks, speed) => {
       setProgress(progressPercent);
-      setStats(prev => ({
-        ...prev,
+      setStats({
         currentChunk,
-        totalChunks
-      }));
+        totalChunks,
+        speed: speed || 0
+      });
     };
 
     rtc.onComplete = () => {
@@ -71,6 +78,17 @@ function SendPage() {
     rtc.onError = (err) => {
       setError(err.message);
       setConnectionState('error');
+      setReconnecting(false);
+    };
+
+    rtc.onReconnecting = (attempt, maxAttempts) => {
+      setReconnecting(true);
+      setReconnectAttempt(attempt);
+      setConnectionState('reconnecting');
+    };
+
+    rtc.onConnectionQuality = (quality) => {
+      setConnectionQuality(quality);
     };
 
     rtc.connect().catch(err => {
@@ -116,6 +134,14 @@ function SendPage() {
     return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
   };
 
+  const formatSpeed = (bytesPerSecond) => {
+    if (!bytesPerSecond || bytesPerSecond === 0) return '0 B/s';
+    const k = 1024;
+    const sizes = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
+    const i = Math.floor(Math.log(bytesPerSecond) / Math.log(k));
+    return Math.round(bytesPerSecond / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+  };
+
   const getStatusDisplay = () => {
     if (complete) {
       return (
@@ -125,7 +151,16 @@ function SendPage() {
         </div>
       );
     }
-    
+
+    if (reconnecting) {
+      return (
+        <div className="status status-connecting">
+          <div className="status-indicator"></div>
+          <span>Reconnecting... (attempt {reconnectAttempt}/3)</span>
+        </div>
+      );
+    }
+
     if (error) {
       return (
         <div className="status status-error">
@@ -242,6 +277,10 @@ function SendPage() {
                   </div>
                   <div className="stat-label">Chunks</div>
                 </div>
+                <div className="stat-card">
+                  <div className="stat-value">{formatSpeed(stats.speed)}</div>
+                  <div className="stat-label">Speed</div>
+                </div>
               </div>
 
               <div className="progress-container mt-3">
@@ -252,6 +291,13 @@ function SendPage() {
                   transition={{ duration: 0.3 }}
                 />
               </div>
+
+              {(connectionQuality.rtt > 0 || connectionState === 'connected') && (
+                <div style={{ marginTop: '1rem', fontSize: '0.875rem', color: 'var(--text-dim)', textAlign: 'center' }}>
+                  Connection Quality: {connectionQuality.rtt > 0 ? `${connectionQuality.rtt}ms RTT` : 'Measuring...'}
+                  {connectionQuality.packetLoss > 0 && ` • ${connectionQuality.packetLoss}% loss`}
+                </div>
+              )}
             </motion.div>
           )}
 
